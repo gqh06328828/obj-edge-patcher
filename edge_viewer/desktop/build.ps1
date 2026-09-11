@@ -15,11 +15,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $outputRoot 'EdgeScope.exe'))) {
 }
 $appRoot = Join-Path $outputRoot 'resources/app'
 New-Item -ItemType Directory -Force -Path $appRoot,(Join-Path $appRoot 'desktop') | Out-Null
-foreach ($name in @('package.json','index.html','style.css','app.mjs','mesh-data.mjs')) {
+foreach ($name in @('package.json','index.html','style.css','app.mjs','mesh-data.mjs','step-view.mjs','step-panel.mjs','view-settings.mjs','patch-edit.mjs','step-worker.js','model-pairs.mjs')) {
   Copy-Item -LiteralPath (Join-Path $sourceRoot $name) -Destination $appRoot -Force
 }
 Copy-Item -LiteralPath (Join-Path $sourceRoot 'vendor') -Destination $appRoot -Recurse -Force
-foreach ($name in @('main.cjs','preload.cjs')) {
+foreach ($name in @('main.cjs','preload.cjs','readout-results.cjs','merged-export.mjs')) {
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $appRoot 'desktop') -Force
 }
 Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.txt' | Copy-Item -Destination $outputRoot -Force

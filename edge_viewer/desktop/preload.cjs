@@ -1,9 +1,14 @@
 const {contextBridge,ipcRenderer}=require('electron');
 contextBridge.exposeInMainWorld('edgeDesktop',Object.freeze({
+  setTheme:value=>ipcRenderer.invoke('set-theme',value),
+  chooseStep:()=>ipcRenderer.invoke('choose-step'),
+  chooseStepDirectory:()=>ipcRenderer.invoke('choose-step-directory'),
   chooseModel:()=>ipcRenderer.invoke('choose-model'),
-  chooseProbability:()=>ipcRenderer.invoke('choose-probability'),
+  clearReadout:()=>ipcRenderer.invoke('clear-readout'),
+  downloadReadout:()=>ipcRenderer.invoke('download-readout'),
   chooseDirectory:()=>ipcRenderer.invoke('choose-directory'),
-  saveImage:(url,name)=>ipcRenderer.invoke('save-image',url,name),
+  saveImage:(url,name,view)=>ipcRenderer.invoke('save-image',url,name,view),
+  saveMerged:options=>ipcRenderer.invoke('save-merged-readout',options),
   runReadout:options=>ipcRenderer.invoke('run-readout',options),
   cancelReadout:()=>ipcRenderer.invoke('cancel-readout'),
   chooseSegmentation:()=>ipcRenderer.invoke('choose-segmentation'),

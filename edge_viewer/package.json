@@ -5,5 +5,11 @@
   "description": "三维模型边界概率桌面查看器",
   "main": "desktop/main.cjs",
   "private": true,
-  "scripts": {"verify": "node verify.mjs", "build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/build.ps1"}
+  "scripts": {
+    "verify": "node verify.mjs",
+    "build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File desktop/build.ps1",
+    "verify:step": "node verify-step.mjs",
+    "verify:workflow": "node verify-workflow.cjs",
+    "verify:views": "node verify-view-settings.mjs"
+  }
 }
