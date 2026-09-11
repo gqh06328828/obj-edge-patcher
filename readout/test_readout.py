@@ -44,6 +44,15 @@ def solve(v,f,p,**options):
     return Readout(v,f,incident,probabilities,positions,cfg).run(log=lambda _:None)
 
 
+def axial_rings(v,f):
+    inc,_=topology(v,f)
+    levels=np.floor(v[f].mean(axis=1)[:,2]*2+1e-8).astype(int)
+    p=np.full(len(inc),.01)
+    ii=np.flatnonzero(inc[:,1]>=0)
+    p[ii[levels[inc[ii,0]]!=levels[inc[ii,1]]]]=.9999
+    return p
+
+
 class ReadoutTests(unittest.TestCase):
     def test_plane_not_fragmented_by_random_false_edges(self):
         v,f=grid();inc,pos=topology(v,f)
@@ -97,14 +106,110 @@ class ReadoutTests(unittest.TestCase):
         self.assertEqual(accepted,1)
         solver.validate(labels)
 
-    def test_supported_network_boundary_on_a_plane(self):
+    def test_equivalent_plane_overrides_high_probability_boundary(self):
         v,f=grid();inc,pos=topology(v,f);p=np.full(len(inc),.01)
         side=v[f].mean(axis=1)[:,0]>0
         internal=inc[:,1]>=0;ii=inc[internal]
         p[np.flatnonzero(internal)[side[ii[:,0]]!=side[ii[:,1]]]]=.99
         labels,report=solve(v,f,p)
-        self.assertEqual(report['patch_count'],2)
-        self.assertLessEqual(report['final_energy']['total'],report['energy_after_minimum']['total']+1e-8)
+        self.assertEqual(report['patch_count'],1)
+        self.assertGreater(report['surface_merges'].get('plane',0),0)
+
+    def test_high_probability_rings_on_cylinder(self):
+        v,f=cylinder();labels,report=solve(v,f,axial_rings(v,f))
+        self.assertEqual(report['patch_count'],1)
+        self.assertGreater(report['surface_merges'].get('revolution',0),0)
+
+    def test_high_probability_rings_on_cone(self):
+        v,f=cylinder(h=24)
+        v[:,:2]*=(1-.35*v[:,2,None])
+        labels,report=solve(v,f,axial_rings(v,f))
+        self.assertEqual(report['patch_count'],1)
+
+    def test_regular_curvature_change(self):
+        v,f=grid(36)
+        v[:,2]=.6*v[:,0]**2+.15*v[:,0]**3
+        inc,_=topology(v,f);p=np.full(len(inc),.01)
+        side=np.floor((v[f].mean(axis=1)[:,0]+.5)*3).astype(int)
+        ii=np.flatnonzero(inc[:,1]>=0)
+        p[ii[side[inc[ii,0]]!=side[inc[ii,1]]]]=.999
+        labels,report=solve(v,f,p)
+        self.assertEqual(report['patch_count'],1)
+
+    def test_tangent_plane_curved_surface_retains_interface(self):
+        v,f=grid(36)
+        v[:,2]=np.maximum(v[:,0],0)**2*1.5
+        inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,np.full(len(inc),.99),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,0]>0
+        self.assertIsNone(solver.evidence.certify(np.flatnonzero(side),np.flatnonzero(~side)))
+        labels=solver.coarsen(side.astype(int))
+        self.assertEqual(len(np.unique(labels)),2)
+
+    def test_distinct_coaxial_cones_retained(self):
+        v,f=cylinder(h=24)
+        v[:,:2]*=(1-.1*v[:,2,None]-.3*np.maximum(v[:,2,None]-1,0))
+        inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,axial_rings(v,f),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,2]>1
+        self.assertIsNone(solver.evidence.certify(np.flatnonzero(side),np.flatnonzero(~side)))
+        labels,report=solver.run(log=lambda _:None)
+        self.assertGreaterEqual(report['patch_count'],2)
+        self.assertTrue(set(labels[side]).isdisjoint(set(labels[~side])))
+
+    def test_surface_rule_is_shared_by_split(self):
+        v,f=cylinder(h=24);v[:,:2]*=(1-.35*v[:,2,None])
+        inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,axial_rings(v,f),pos,Config(min_faces=25,min_area_fraction=.01))
+        labels,accepted=solver.split(np.zeros(len(f),dtype=int))
+        self.assertEqual(accepted,0)
+        self.assertGreater(solver.report['surface_split_vetoes'],0)
+
+    def test_round_transition_revolution_merges(self):
+        v,f=cylinder(n=72,h=24)
+        t=v[:,2]*np.pi/4
+        v[:,:2]*=(2-.5*np.cos(t))[:,None]
+        v[:,2]=.5*np.sin(t)
+        inc,pos=topology(v,f)
+        # Two circumference sectors and two meridional bands of one torus.
+        xyz=v[f].mean(axis=1)
+        labels=(xyz[:,0]>0).astype(int)+2*(xyz[:,2]>.35)
+        p=np.full(len(inc),.01);ii=np.flatnonzero(inc[:,1]>=0)
+        p[ii[labels[inc[ii,0]]!=labels[inc[ii,1]]]]=.999
+        s=Readout(v,f,inc,p,pos,Config(min_faces=25,min_area_fraction=.01))
+        result=s.coarsen(labels)
+        self.assertEqual(len(np.unique(result)),1)
+        self.assertGreater(s.report['surface_merges'].get('torus',0),0)
+
+    def test_union_revalidation_blocks_transitive_leak(self):
+        v,f=grid(48)
+        v[:,2]=np.maximum(v[:,0]-.15,0)**2*4
+        inc,pos=topology(v,f)
+        side=np.where(v[f].mean(axis=1)[:,0]<-.15,0,np.where(v[f].mean(axis=1)[:,0]<.15,1,2))
+        s=Readout(v,f,inc,np.full(len(inc),.99),pos,Config(min_faces=25,min_area_fraction=.01))
+        labels=s.coarsen(side.copy())
+        self.assertEqual(len(np.unique(labels[side<2])),1)
+        self.assertTrue(set(labels[side<2]).isdisjoint(set(labels[side==2])))
+        # A second coarsening call must retain the certified union's envelope.
+        labels=s.coarsen(labels)
+        self.assertTrue(set(labels[side<2]).isdisjoint(set(labels[side==2])))
+
+    def test_rotated_scaled_cone_with_noise(self):
+        v,f=cylinder(n=72,h=24);v[:,:2]*=(1-.25*v[:,2,None])
+        probabilities=axial_rings(v,f)
+        v+=np.random.default_rng(42).normal(0,.00015,v.shape)
+        rotation,_=np.linalg.qr(np.array([[1.,2.,3.],[4.,-3.,1.],[2.,1.,-2.]]))
+        v=(v@rotation)*150+[100,-350,230]
+        labels,report=solve(v,f,probabilities)
+        self.assertEqual(report['patch_count'],1)
+
+    def test_bent_cylinder_axes_remain_distinct(self):
+        v,f=cylinder(n=72,h=24)
+        v[:,0]+=.6*np.maximum(v[:,2]-1,0)
+        inc,pos=topology(v,f)
+        s=Readout(v,f,inc,axial_rings(v,f),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,2]>1
+        self.assertIsNone(s.evidence.certify(np.flatnonzero(side),np.flatnonzero(~side)))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

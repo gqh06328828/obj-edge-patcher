@@ -9,20 +9,22 @@
 | 路径 | 内容 |
 |---|---|
 | `readout/geometry_readout.py` | 读出算法、输入映射校验、Python API、命令行与结果导出 |
-| `readout/test_readout.py` | 9 项不依赖私有模型的合成回归测试 |
+| `readout/surface_evidence.py` | v2 曲面连续性、解析面拟合与曲率交叉验证 |
+| `readout/test_readout.py` | 不依赖私有模型的合成回归测试 |
 | `readout/DESIGN.md` | 算法目标、参数、约束及限制 |
 | `readout/RESULTS.md` | 当前 6 个本地样本的运行摘要；不是 STEP 精度评价 |
+| `readout/RESULTS_V2.md` | v2 实际模型验证与限制 |
 | `edge_viewer/` | Three.js 概率/分片查看器 |
 | `edge_viewer/desktop/` | Electron 主进程、原生文件选择、后台读出连接与 Windows 打包脚本 |
 | `edge_viewer/vendor/` | 固定版本前端依赖及其许可证 |
 
 ## 读出算法
 
-当前是定向二次曲面代理的区域图优化：连通微区域初始化 → 联合几何/概率的区域合并 → 必要的重新切分 → 最小规模强制约束 → 保持连通的边界细化。
+当前默认是 v2 曲面连续性读出：连通微区域 → 几何/概率组装与同一曲面验证合并 → 使用相同连续性判据的重新切分 → 最小规模约束 → 边界细化和合并复核。没有旧算法模式开关。
 
 低概率不会禁止切分；高概率不会强制切分。每片须满足连通、最少三角形数和最小面积限制。算法只读取网格和概率，不把 STEP 或已有分片颜色作为推理输入。
 
-它是第一版局部优化实现，尚不能保证每个分片对应一个 BRep 面。当前边界沿现有网格边，复杂圆环和过渡面可能过分割或欠分割。细节见 [算法设计](readout/DESIGN.md)。
+同一圆柱、圆锥、圆环形过渡面和规则缓变曲面可以通过几何证据合并，即使中间存在高概率边；仅相切或平均法向接近不足以合并。仍不能保证每片对应一个 BRep 面，复杂曲面可能过分割或欠分割。细节和参数见 [算法设计](readout/DESIGN.md)。
 
 ## 安装与运行读出
 
@@ -70,7 +72,7 @@ python -m unittest discover -s readout -p test_readout.py -v
 ```shell
 git switch -c experiment/my-readout-change
 # 修改算法并运行测试
-git add readout/geometry_readout.py readout/test_readout.py
+git add readout/geometry_readout.py readout/surface_evidence.py readout/test_readout.py
 git diff --cached
 git commit -m "Describe the readout change and its purpose"
 git push -u origin experiment/my-readout-change

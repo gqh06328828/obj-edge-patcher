@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import time
 import numpy as np
+from surface_evidence import SurfaceEvidence
 
 
 @dataclass
@@ -28,6 +29,11 @@ class Config:
     min_area_fraction: float = 0.0004
     split_passes: int = 2
     refine_passes: int = 2
+    continuation_distance: float = 0.60
+    continuation_normal: float = 0.40
+    continuation_curvature: float = 0.25
+    continuation_min_faces: int = 48
+    surface_samples: int = 192
 
 
 class DSU:
@@ -183,6 +189,10 @@ class Readout:
         c = self.cfg
         if min(c.normal_sigma,c.distance_edges,c.region_penalty,c.probability_clip,c.min_faces,c.seed_faces)<=0 or not 0<=c.min_area_fraction<=1 or c.boundary_weight<0:
             raise ValueError('Invalid configuration')
+        if (not all(np.isfinite(value) for value in asdict(c).values()) or
+            min(c.continuation_distance,c.continuation_normal,c.continuation_curvature)<=0 or
+            c.continuation_min_faces<12 or c.surface_samples<24):
+            raise ValueError('Invalid surface-continuation configuration')
         self.vertices, self.faces = vertices, faces
         self.n = len(faces)
         tri = vertices[faces]
@@ -228,8 +238,14 @@ class Readout:
         logits = np.clip(np.log(np.clip(1-p,1e-7,1)/np.clip(p,1e-7,1)), -c.probability_clip,c.probability_clip)
         area_geometry = norms.sum()/2/scale**2
         self.cost = c.boundary_weight*self.length/np.sqrt(area_geometry)*logits
-        self.report = {'config':asdict(c),'method':'oriented-quadric-region-readout-v1','step_used_for_inference':False,
-                       'triangle_count':self.n,'missing_predictions':int(np.isnan(probabilities).sum()),'forced_merges':0,'accepted_splits':0,'refinement_moves':0}
+        self.evidence = SurfaceEvidence(self)
+        self._certified_groups={}
+        self.report = {'config':asdict(c),'method':'surface-continuation-readout-v2','step_used_for_inference':False,
+                       'triangle_count':self.n,'missing_predictions':int(np.isnan(probabilities).sum()),'forced_merges':0,'accepted_splits':0,'refinement_moves':0,
+                       'surface_merges':{},'surface_merge_events':[],'surface_split_vetoes':0,
+                       'energy_interpretation':'Diagnostic quadric proxy; certified geometry merges may increase this value.'}
+        self.report['implementation_sha256']={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                              for name in ('geometry_readout.py','surface_evidence.py')}
 
     @staticmethod
     def features(x):
@@ -270,10 +286,18 @@ class Readout:
                 dsu.union(a,b)
         return dsu.labels()
 
-    def coarsen(self, labels, enforce_minimum=False):
+    def coarsen(self, labels, enforce_minimum=False, certificates_only=False):
         labels=np.unique(labels,return_inverse=True)[1]
         matrix,rhs,area,count=self.aggregate(labels)
         nr=len(area);parent=np.arange(nr);active=np.ones(nr,dtype=bool);version=np.zeros(nr,dtype=int)
+        order=np.argsort(labels,kind='stable')
+        members=list(np.split(order,np.cumsum(count)[:-1]))
+        certificates={}
+        protected=np.zeros(nr,dtype=bool)
+        for i,group in enumerate(members):
+            previous=self._certified_groups.get(int(group[0]))
+            protected[i]=previous is not None and np.array_equal(previous,group)
+        certificate_phase=certificates_only
         energy=np.array([self.fit(matrix[i],rhs[i],area[i])[0] for i in range(nr)])
         adj=[{} for _ in range(nr)]
         for e,(u,v) in zip(self.internal_ids,self.uv):
@@ -282,16 +306,37 @@ class Readout:
                 adj[a][b]=adj[a].get(b,0.)+self.cost[e]
                 adj[b][a]=adj[b].get(a,0.)+self.cost[e]
         heap=[]
-        def delta(a,b):
+        def delta(a,b,allow_certificate=True):
             merged=self.fit(matrix[a]+matrix[b],rhs[a]+rhs[b],area[a]+area[b])[0]
-            return merged-energy[a]-energy[b]-self.cfg.region_penalty-adj[a][b],merged
+            change=merged-energy[a]-energy[b]-self.cfg.region_penalty-adj[a][b]
+            needs_certificate=certificates_only or change>=-1e-10 or protected[a] or protected[b]
+            if (certificate_phase or protected[a] or protected[b]) and needs_certificate and allow_certificate:
+                key=(min(a,b),max(a,b),int(version[min(a,b)]),int(version[max(a,b)]))
+                if key not in certificates:
+                    certificates[key]=self.evidence.certify(members[a],members[b])
+                model=certificates[key]
+                if model is not None:
+                    # Geometry is a decision criterion, not an unbounded
+                    # numerical reward. This also avoids a high-p ring veto.
+                    return -self.cfg.region_penalty,merged,model.kind
+                if certificates_only or protected[a] or protected[b]:
+                    return float('inf'),merged,None
+            return change,merged,None
         def push(a,b):
             if a>b:a,b=b,a
-            change,merged=delta(a,b)
-            heapq.heappush(heap,(change,a,b,int(version[a]),int(version[b]),merged))
-        def merge(a,b,merged):
+            change,merged,kind=delta(a,b)
+            heapq.heappush(heap,(change,a,b,int(version[a]),int(version[b]),merged,kind))
+        def merge(a,b,merged,kind=None):
             if len(adj[a])<len(adj[b]):a,b=b,a
+            if kind is not None:
+                self.report['surface_merge_events'].append({'model':kind,'left_anchor_triangle':int(members[a][0])+1,
+                    'right_anchor_triangle':int(members[b][0])+1,'left_faces':int(count[a]),'right_faces':int(count[b]),
+                    'interface_probability_cost':float(adj[a][b]),'proxy_geometry_increase':float(merged-energy[a]-energy[b])})
             matrix[a]+=matrix[b];rhs[a]+=rhs[b];area[a]+=area[b];count[a]+=count[b];energy[a]=merged
+            members[a]=np.sort(np.concatenate([members[a],members[b]]));members[b]=np.empty(0,dtype=int)
+            protected[a]=kind is not None
+            if kind is not None:
+                counts=self.report['surface_merges'];counts[kind]=counts.get(kind,0)+1
             active[b]=False;parent[b]=a;version[a]+=1;version[b]+=1
             adj[a].pop(b,None)
             for neighbor,cost in list(adj[b].items()):
@@ -304,12 +349,20 @@ class Readout:
         for a in range(nr):
             for b in adj[a]:
                 if a<b:push(a,b)
-        while heap:
-            change,a,b,va,vb,merged=heapq.heappop(heap)
-            if not active[a] or not active[b] or va!=version[a] or vb!=version[b]:continue
-            if change>=-1e-10:break
-            root=merge(a,b,merged)
-            for neighbor in adj[root]:push(root,neighbor)
+        while True:
+            while heap:
+                change,a,b,va,vb,merged,kind=heapq.heappop(heap)
+                if not active[a] or not active[b] or va!=version[a] or vb!=version[b]:continue
+                if change>=-1e-10:break
+                root=merge(a,b,merged,kind)
+                for neighbor in adj[root]:push(root,neighbor)
+            if certificate_phase:break
+            # Expensive continuation checks need supported regions. Assemble
+            # micro-regions cheaply first, then use the same RAG/merge updater.
+            certificate_phase=True;heap.clear()
+            for a in np.flatnonzero(active):
+                for b in adj[a]:
+                    if a<b:push(int(a),b)
         if enforce_minimum:
             while True:
                 small=np.flatnonzero(active & ((count<self.cfg.min_faces)|(area<self.cfg.min_area_fraction)))
@@ -317,13 +370,15 @@ class Readout:
                 a=int(small[np.argmin(area[small])])
                 if not adj[a]:
                     raise ValueError(f'Input disconnected component has only {count[a]} faces / area fraction {area[a]:.8g}; cannot satisfy minimum without joining disconnected geometry. Lower the explicit minimum or process separately.')
-                candidates=[(*delta(a,b),b) for b in adj[a]]
-                change,merged,b=min(candidates)
+                candidates=[(delta(a,b,False)[0],int(b)) for b in adj[a]]
+                change,b=min(candidates)
+                _,merged,_=delta(a,b,False)
                 merge(a,b,merged);self.report['forced_merges']+=1
         for i in range(nr):
             r=i
             while parent[r]!=r:r=parent[r]
             parent[i]=r
+        self._certified_groups={int(members[i][0]):members[i].copy() for i in np.flatnonzero(active & protected)}
         return np.unique(parent[labels],return_inverse=True)[1]
 
     def split(self, labels):
@@ -357,6 +412,10 @@ class Readout:
             child=members[np.array([result[int(i)] for i in members])==1]
             ca=float(self.area[child].sum())
             if min(len(child),len(members)-len(child))<self.cfg.min_faces or min(ca,area[region]-ca)<self.cfg.min_area_fraction:continue
+            other=members[np.array([result[int(i)] for i in members])==0]
+            if self.evidence.certify(other,child) is not None:
+                self.report['surface_split_vetoes']+=1
+                continue
             B=self.B[child];w=self.area[child]
             m1=np.einsum('nki,nkj,n->ij',B,B,w);b1=np.einsum('nki,nk,n->i',B,self.target[child],w)
             e1=self.fit(m1,b1,ca)[0];e0=self.fit(matrix[region]-m1,rhs[region]-b1,area[region]-ca)[0]
@@ -369,6 +428,15 @@ class Readout:
     def refine(self, labels):
         matrix,rhs,area,count=self.aggregate(labels)
         energies=np.array([self.fit(matrix[i],rhs[i],area[i])[0] for i in range(len(area))])
+        # Keep a geometric envelope during this sweep. A network-driven
+        # single-face move must not pull a certified surface into its neighbor.
+        models={}
+        for region in range(len(area)):
+            group=np.flatnonzero(labels==region)
+            for kind in ('plane','revolution','sphere','torus','graph2','graph'):
+                model=self.evidence.fit(kind,group)
+                if model is not None and self.evidence.residual(model,group)<=1:
+                    models[region]=model;break
         moved=0
         def removal_connected(face,region):
             neighbors={v for v,e in self.adj[face] if labels[v]==region}
@@ -391,6 +459,9 @@ class Readout:
             source_energy=self.fit(matrix[source]-m,rhs[source]-b,area[source]-w)[0]
             best=None
             for dest in sorted(destinations):
+                if dest in models and self.evidence.residual(models[dest],[u])>1:continue
+                if source in models and dest in models:
+                    if self.evidence.residual(models[source],[u])+0.1<self.evidence.residual(models[dest],[u]):continue
                 dest_energy=self.fit(matrix[dest]+m,rhs[dest]+b,area[dest]+w)[0]
                 pair=sum(self.cost[e]*(int(dest!=labels[v])-int(source!=labels[v])) for v,e in self.adj[u])
                 delta=source_energy+dest_energy-energies[source]-energies[dest]+pair
@@ -415,7 +486,7 @@ class Readout:
         labels=self.initial_regions();self.report['initial_regions']=int(labels.max()+1)
         log(f'Connected micro-regions: {labels.max()+1}')
         labels=self.coarsen(labels);self.report['after_energy_merging']=int(labels.max()+1)
-        log(f'Energy-based merge: {labels.max()+1} regions')
+        log(f'Energy-based merge: {labels.max()+1} regions; surface certificates={sum(self.report["surface_merges"].values())}')
         for _ in range(self.cfg.split_passes):
             labels,n=self.split(labels)
             if not n:break
@@ -427,6 +498,10 @@ class Readout:
         for _ in range(self.cfg.refine_passes):
             labels,n=self.refine(labels)
             if not n:break
+            # Boundary repair can remove contaminated interface triangles and
+            # make a previously rejected continuation observable. Reuse the
+            # very same merge rule; never add a relaxed final merge threshold.
+            labels=self.coarsen(labels,certificates_only=True)
         self.validate(labels)
         self.report['final_energy']=self.energy(labels)
         self.report['elapsed_seconds']=time.perf_counter()-started
@@ -505,8 +580,14 @@ def main():
     parser.add_argument('--min-faces',type=int,default=80);parser.add_argument('--min-area',type=float,default=.0004)
     parser.add_argument('--normal-sigma',type=float,default=.20);parser.add_argument('--distance-edges',type=float,default=.35)
     parser.add_argument('--boundary-weight',type=float,default=.002);parser.add_argument('--region-penalty',type=float,default=.0008)
+    parser.add_argument('--continuation-distance',type=float,default=.60)
+    parser.add_argument('--continuation-normal',type=float,default=.40)
+    parser.add_argument('--continuation-curvature',type=float,default=.25)
+    parser.add_argument('--continuation-min-faces',type=int,default=48)
     args=parser.parse_args()
-    config=Config(min_faces=args.min_faces,min_area_fraction=args.min_area,normal_sigma=args.normal_sigma,distance_edges=args.distance_edges,boundary_weight=args.boundary_weight,region_penalty=args.region_penalty)
+    config=Config(min_faces=args.min_faces,min_area_fraction=args.min_area,normal_sigma=args.normal_sigma,distance_edges=args.distance_edges,boundary_weight=args.boundary_weight,region_penalty=args.region_penalty,
+                  continuation_distance=args.continuation_distance,continuation_normal=args.continuation_normal,
+                  continuation_curvature=args.continuation_curvature,continuation_min_faces=args.continuation_min_faces)
     print('Reading mesh and validating full edge correspondence...',flush=True)
     vertices,faces=load_mesh(args.mesh);predictions=read_predictions(args.probabilities)
     positions=validate_mapping(vertices,faces,predictions,Path(args.mesh).suffix.lower()=='.obj')
