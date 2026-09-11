@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>EdgeScope · 边界概率查看器</title><link rel="stylesheet" href="style.css"><script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script><script src="vendor/xlsx.full.min.js"></script></head>
+<body><header><div class="brand"><span class="logo">◈</span> EdgeScope <span class="subtitle">边界概率查看器</span></div><span class="local"><i></i> 本地交互预览</span></header>
+<main><aside><div class="section-label">01 / 数据</div><h2>探索模型的每一条边</h2><p class="muted">将网络预测映射到真实网格，查看边界形成的概率。</p>
+<div id="desktopFiles" hidden>
+<button id="chooseModel" class="file-select"><span>① 选择模型</span><small>OBJ / PLY</small></button><div id="desktopMeshName" class="file-name">未选择模型</div>
+<button id="chooseProbability" class="file-select"><span>② 选择概率表</span><small>CSV / XLS / XLSX</small></button><div id="desktopProbabilityName" class="file-name">未选择概率表</div>
+<button id="loadDesktop" class="primary">③ 加载模型与概率 <span>↗</span></button>
+<small>同目录、同名的概率表将自动配对，也可以手动更换。</small><div class="divider"></div>
+<button id="chooseDirectory" class="folder-select">选择模型文件夹…</button><div id="directoryInfo" class="file-name">本地模型库</div>
+<details id="readoutPanel"><summary>几何分片读出</summary><small>结合曲面拟合与边概率，保持每片连通。设置越大的最小片，越可能合并真实小面。</small>
+<label>每片最少三角形<input id="minFaces" type="number" min="1" step="1" value="80"></label>
+<label>最小面积占比（%）<input id="minArea" type="number" min="0" max="100" step="0.01" value="0.04"></label>
+<label>法向拟合容差<input id="normalSigma" type="number" min="0.05" max="1" step="0.01" value="0.20"></label>
+<button id="runReadout" class="primary">运行几何分片</button><button id="cancelReadout" hidden>取消计算</button>
+<button id="chooseSegmentation">加载已保存的分片标签…</button><p id="readoutInfo" class="file-name">读出结果会保存在你选择的文件夹中。</p></details>
+</div>
+<label>模型列表<select id="models" aria-label="模型列表"></select></label><button id="loadSample" class="primary">加载所选模型 <span>↗</span></button><details id="browserFiles"><summary>导入自己的文件</summary><label>三角网格 · OBJ / PLY<input id="meshFile" type="file" accept=".obj,.ply"></label><label>概率表 · CSV / XLS / XLSX<input id="probFile" type="file" accept=".csv,.xls,.xlsx"></label><button id="loadFiles">加载文件</button><small>表格需包含 edge_id、vertex_1、vertex_2、boundary_probability。PLY 还需 incident_triangle_ids。</small></details>
+<div class="divider"></div><div class="section-label">02 / 颜色与显示</div><label class="row">边的主色<input id="color" type="color" value="#254bd4"></label><div class="swatches"><button data-color="#254bd4" style="--swatch:#254bd4" aria-label="蓝色"></button><button data-color="#146b50" style="--swatch:#146b50" aria-label="绿色"></button><button data-color="#9e303f" style="--swatch:#9e303f" aria-label="红色"></button><button data-color="#7139a4" style="--swatch:#7139a4" aria-label="紫色"></button><button data-color="#343b45" style="--swatch:#343b45" aria-label="灰色"></button></div>
+<label id="displayModeLabel" hidden>查看内容<select id="displayMode"><option value="probability">网络边概率</option><option value="patches">几何分片结果</option></select><small id="modeHint"></small></label>
+<div id="gradient" class="gradient"></div><div class="scale"><span>0 · 浅</span><span>边界概率</span><span>1 · 深</span></div>
+<label>颜色对比度 <output id="contrastValue">1.00</output><input id="contrast" type="range" min="0.2" max="3" step="0.05" value="1"></label><small>仅调整颜色曲线，原始概率保持不变。</small>
+<label>显示概率 ≥ <output id="thresholdValue">0.00</output><input id="threshold" type="range" min="0" max="1" step="0.01" value="0"></label><label class="check"><input id="surface" type="checkbox" checked>显示模型表面</label><label class="check"><input id="xray" type="checkbox">透视显示背面边</label><label class="check"><input id="auto" type="checkbox">自动旋转</label>
+<div class="divider"></div><div class="section-label">03 / 概率分布</div><canvas id="histogram" height="64"></canvas><div class="scale"><span>0</span><span id="validCount">等待加载</span><span>1</span></div><p class="footnote">显示原始 boundary_probability，未使用校准概率或最终分区颜色。无预测的边以灰色显示。</p></aside>
+<section id="viewport"><div class="view-top"><div><span class="eyebrow">3D MESH / EDGE PROBABILITY</span><h1 id="modelName">准备加载模型</h1></div><div class="toolbar"><button id="reset">重置视角</button><button id="capture">保存图片</button></div></div><div id="stage"></div><div id="status" role="status">正在初始化…</div><div id="selection"><span class="section-label">单边检查</span><p id="edgeInfo">点击模型上的边，查看原始概率和顶点编号。</p></div><div class="view-bottom"><div class="stats"><div><strong id="faceCount">—</strong><span>三角形</span></div><div><strong id="edgeCount">—</strong><span>总边数</span></div><div><strong id="visibleCount">—</strong><span>当前显示</span></div></div><span class="help">左键旋转 · 滚轮缩放 · 右键平移 · 点击选边</span></div></section></main><script type="module" src="app.mjs"></script></body></html>

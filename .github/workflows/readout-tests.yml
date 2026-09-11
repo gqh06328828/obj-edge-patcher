@@ -1,0 +1,20 @@
+name: Readout regression tests
+on:
+  push:
+    paths:
+      - 'readout/**'
+      - '.github/workflows/readout-tests.yml'
+  pull_request:
+    paths:
+      - 'readout/**'
+      - '.github/workflows/readout-tests.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r readout/requirements.txt
+      - run: python -m unittest discover -s readout -p test_readout.py -v

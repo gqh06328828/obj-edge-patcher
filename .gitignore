@@ -1,0 +1,31 @@
+# Local model inputs and generated segmentation results
+/manual_test/
+/readout/results/
+
+# Packaged application, downloaded runtimes, and local application state
+/EdgeScope-Windows/
+/edge_viewer/build-cache/
+**/user-data/
+*.lnk
+
+# Python / editor / system caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+*.log
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Agent-local configuration
+.codex/
+.agents/
