@@ -53,7 +53,76 @@ def axial_rings(v,f):
     return p
 
 
+def freeform_grid(n=48):
+    v,f=grid(n)
+    x,y=v[:,:2].T
+    v[:,2]=.07*np.sin(3*np.pi*x)*np.cos(2*np.pi*y)+.08*np.sin(2*np.pi*y)+.12*x*y
+    return v,f
+
+
 class ReadoutTests(unittest.TestCase):
+    def test_freeform_low_probability_does_not_require_global_quadric(self):
+        v,f=freeform_grid()
+        labels,report=solve(v,f,.01)
+        self.assertEqual(report['patch_count'],1)
+        self.assertGreater(report['surface_merges'].get('freeform',0),0)
+
+    def test_freeform_merge_preserves_supported_probability_boundary(self):
+        v,f=freeform_grid()
+        inc,pos=topology(v,f);p=np.full(len(inc),.01)
+        side=v[f].mean(axis=1)[:,0]>0
+        ii=np.flatnonzero(inc[:,1]>=0)
+        p[ii[side[inc[ii,0]]!=side[inc[ii,1]]]]=.99
+        solver=Readout(v,f,inc,p,pos,Config(min_faces=25,min_area_fraction=.01))
+        # The new merge criterion must preserve this already-observed seam;
+        # this does not assert the full initializer recovers exact CAD labels.
+        labels=solver.coarsen(side.astype(int))
+        self.assertEqual(len(np.unique(labels)),2)
+        self.assertTrue(set(labels[side]).isdisjoint(set(labels[~side])))
+
+    def test_freeform_rule_rejects_low_probability_curvature_jump(self):
+        v,f=grid(48);v[:,2]=np.maximum(v[:,0],0)**2*1.5
+        inc,pos=topology(v,f)
+        s=Readout(v,f,inc,np.full(len(inc),.01),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,0]>0;ii=np.flatnonzero(inc[:,1]>=0)
+        interface=ii[side[inc[ii,0]]!=side[inc[ii,1]]]
+        self.assertIsNone(s.freeform.certify(interface))
+
+    def test_freeform_rule_does_not_use_a_low_probability_gap(self):
+        v,f=freeform_grid();inc,pos=topology(v,f);p=np.full(len(inc),.01)
+        side=v[f].mean(axis=1)[:,0]>0;ii=np.flatnonzero(inc[:,1]>=0)
+        interface=ii[side[inc[ii,0]]!=side[inc[ii,1]]];p[interface]=.99;p[interface[:2]]=.001
+        s=Readout(v,f,inc,p,pos,Config(min_faces=25,min_area_fraction=.01))
+        self.assertIsNone(s.freeform.certify(interface))
+
+    def test_freeform_split_does_not_cut_for_global_fit_error(self):
+        v,f=freeform_grid();inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,np.full(len(inc),.01),pos,Config(min_faces=25,min_area_fraction=.01))
+        labels,accepted=solver.split(np.zeros(len(f),dtype=int))
+        self.assertEqual(accepted,0)
+        self.assertGreater(solver.report['surface_split_vetoes'],0)
+
+    def test_freeform_missing_predictions_do_not_claim_low_probability(self):
+        v,f=freeform_grid();inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,np.full(len(inc),np.nan),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,0]>0;ii=np.flatnonzero(inc[:,1]>=0)
+        interface=ii[side[inc[ii,0]]!=side[inc[ii,1]]]
+        self.assertIsNone(solver.freeform.certify(interface))
+
+    def test_diffuse_high_probability_is_not_a_freeform_boundary_line(self):
+        v,f=freeform_grid(96);inc,pos=topology(v,f)
+        solver=Readout(v,f,inc,np.full(len(inc),.7),pos,Config(min_faces=25,min_area_fraction=.01))
+        side=v[f].mean(axis=1)[:,0]>0
+        labels=solver.coarsen(side.astype(int))
+        self.assertEqual(len(np.unique(labels)),1)
+
+    def test_moderate_probability_ridge_still_blocks_freeform_merge(self):
+        v,f=freeform_grid();inc,pos=topology(v,f);p=np.full(len(inc),.01)
+        side=v[f].mean(axis=1)[:,0]>0;ii=np.flatnonzero(inc[:,1]>=0)
+        interface=ii[side[inc[ii,0]]!=side[inc[ii,1]]];p[interface]=.7
+        solver=Readout(v,f,inc,p,pos,Config(min_faces=25,min_area_fraction=.01))
+        self.assertIsNone(solver.freeform.certify(interface))
+
     def test_plane_not_fragmented_by_random_false_edges(self):
         v,f=grid();inc,pos=topology(v,f)
         p=np.full(len(inc),.01);p[np.random.default_rng(7).choice(len(p),len(p)//15,replace=False)]=.99

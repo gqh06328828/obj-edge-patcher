@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 import numpy as np
 from surface_evidence import SurfaceEvidence
+from freeform_evidence import FreeformEvidence
 
 
 @dataclass
@@ -34,6 +35,10 @@ class Config:
     continuation_curvature: float = 0.25
     continuation_min_faces: int = 48
     surface_samples: int = 192
+    freeform_probability: float = 0.15
+    freeform_curvature: float = 0.50
+    freeform_outlier_fraction: float = 0.08
+    freeform_ridge_contrast: float = 0.15
 
 
 class DSU:
@@ -193,6 +198,8 @@ class Readout:
             min(c.continuation_distance,c.continuation_normal,c.continuation_curvature)<=0 or
             c.continuation_min_faces<12 or c.surface_samples<24):
             raise ValueError('Invalid surface-continuation configuration')
+        if not 0<c.freeform_probability<.5 or not 0<c.freeform_curvature<=1 or not 0<=c.freeform_outlier_fraction<.1 or not 0<c.freeform_ridge_contrast<.5:
+            raise ValueError('Invalid freeform-continuation configuration')
         self.vertices, self.faces = vertices, faces
         self.n = len(faces)
         tri = vertices[faces]
@@ -239,13 +246,15 @@ class Readout:
         area_geometry = norms.sum()/2/scale**2
         self.cost = c.boundary_weight*self.length/np.sqrt(area_geometry)*logits
         self.evidence = SurfaceEvidence(self)
+        self.freeform = FreeformEvidence(self)
         self._certified_groups={}
-        self.report = {'config':asdict(c),'method':'surface-continuation-readout-v2','step_used_for_inference':False,
+        self._freeform_groups={}
+        self.report = {'config':asdict(c),'method':'surface-continuation-readout-v2.1','step_used_for_inference':False,
                        'triangle_count':self.n,'missing_predictions':int(np.isnan(probabilities).sum()),'forced_merges':0,'accepted_splits':0,'refinement_moves':0,
                        'surface_merges':{},'surface_merge_events':[],'surface_split_vetoes':0,
                        'energy_interpretation':'Diagnostic quadric proxy; certified geometry merges may increase this value.'}
         self.report['implementation_sha256']={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                              for name in ('geometry_readout.py','surface_evidence.py')}
+                                              for name in ('geometry_readout.py','surface_evidence.py','freeform_evidence.py')}
 
     @staticmethod
     def features(x):
@@ -294,31 +303,45 @@ class Readout:
         members=list(np.split(order,np.cumsum(count)[:-1]))
         certificates={}
         protected=np.zeros(nr,dtype=bool)
+        freeform=np.zeros(nr,dtype=bool)
         for i,group in enumerate(members):
             previous=self._certified_groups.get(int(group[0]))
             protected[i]=previous is not None and np.array_equal(previous,group)
+            previous=self._freeform_groups.get(int(group[0]))
+            freeform[i]=previous is not None and np.array_equal(previous,group)
         certificate_phase=certificates_only
         energy=np.array([self.fit(matrix[i],rhs[i],area[i])[0] for i in range(nr)])
         adj=[{} for _ in range(nr)]
+        interfaces=[{} for _ in range(nr)]
         for e,(u,v) in zip(self.internal_ids,self.uv):
             a,b=int(labels[u]),int(labels[v])
             if a!=b:
                 adj[a][b]=adj[a].get(b,0.)+self.cost[e]
                 adj[b][a]=adj[b].get(a,0.)+self.cost[e]
+                interfaces[a].setdefault(b,[]).append(int(e))
+                interfaces[b].setdefault(a,[]).append(int(e))
         heap=[]
         def delta(a,b,allow_certificate=True):
             merged=self.fit(matrix[a]+matrix[b],rhs[a]+rhs[b],area[a]+area[b])[0]
             change=merged-energy[a]-energy[b]-self.cfg.region_penalty-adj[a][b]
+            network_barrier=adj[a][b]<-1e-12
             needs_certificate=certificates_only or change>=-1e-10 or protected[a] or protected[b]
             if (certificate_phase or protected[a] or protected[b]) and needs_certificate and allow_certificate:
                 key=(min(a,b),max(a,b),int(version[min(a,b)]),int(version[max(a,b)]))
                 if key not in certificates:
                     certificates[key]=self.evidence.certify(members[a],members[b])
+                    if certificates[key] is None:
+                        certificates[key]=self.freeform.certify(interfaces[a][b])
                 model=certificates[key]
                 if model is not None:
                     # Geometry is a decision criterion, not an unbounded
                     # numerical reward. This also avoids a high-p ring veto.
-                    return -self.cfg.region_penalty,merged,model.kind
+                    # Assemble probability-supported interiors before trying
+                    # to override a predicted boundary using a local model.
+                    # Otherwise two tiny graph patches can erase a good seam
+                    # before the full freeform surface becomes observable.
+                    priority=-self.cfg.region_penalty*(1 if network_barrier else 2)
+                    return priority,merged,model.kind
                 if certificates_only or protected[a] or protected[b]:
                     return float('inf'),merged,None
             return change,merged,None
@@ -335,16 +358,22 @@ class Readout:
             matrix[a]+=matrix[b];rhs[a]+=rhs[b];area[a]+=area[b];count[a]+=count[b];energy[a]=merged
             members[a]=np.sort(np.concatenate([members[a],members[b]]));members[b]=np.empty(0,dtype=int)
             protected[a]=kind is not None
+            freeform[a]=kind=='freeform'
             if kind is not None:
                 counts=self.report['surface_merges'];counts[kind]=counts.get(kind,0)+1
             active[b]=False;parent[b]=a;version[a]+=1;version[b]+=1
             adj[a].pop(b,None)
+            interfaces[a].pop(b,None)
             for neighbor,cost in list(adj[b].items()):
                 adj[neighbor].pop(b,None)
+                interfaces[neighbor].pop(b,None)
                 if neighbor!=a:
                     adj[a][neighbor]=adj[a].get(neighbor,0.)+cost
                     adj[neighbor][a]=adj[a][neighbor]
+                    combined=interfaces[a].get(neighbor,[])+interfaces[b][neighbor]
+                    interfaces[a][neighbor]=combined;interfaces[neighbor][a]=combined
             adj[b].clear()
+            interfaces[b].clear()
             return a
         for a in range(nr):
             for b in adj[a]:
@@ -370,15 +399,23 @@ class Readout:
                 a=int(small[np.argmin(area[small])])
                 if not adj[a]:
                     raise ValueError(f'Input disconnected component has only {count[a]} faces / area fraction {area[a]:.8g}; cannot satisfy minimum without joining disconnected geometry. Lower the explicit minimum or process separately.')
-                candidates=[(delta(a,b,False)[0],int(b)) for b in adj[a]]
-                change,b=min(candidates)
+                candidates=[]
+                for b in adj[a]:
+                    local=self.freeform.certify(interfaces[a][b])
+                    # Minimum cleanup must not prefer a poor global fit over
+                    # a good predicted seam. A local continuation can support
+                    # attachment even when the small side cannot fit a model.
+                    tier=0 if local is not None else (2 if adj[a][b]<0 else 1)
+                    candidates.append((tier,delta(a,b,False)[0],int(b)))
+                tier,change,b=min(candidates)
                 _,merged,_=delta(a,b,False)
-                merge(a,b,merged);self.report['forced_merges']+=1
+                merge(a,b,merged,'freeform' if tier==0 else None);self.report['forced_merges']+=1
         for i in range(nr):
             r=i
             while parent[r]!=r:r=parent[r]
             parent[i]=r
         self._certified_groups={int(members[i][0]):members[i].copy() for i in np.flatnonzero(active & protected)}
+        self._freeform_groups={int(members[i][0]):members[i].copy() for i in np.flatnonzero(active & freeform)}
         return np.unique(parent[labels],return_inverse=True)[1]
 
     def split(self, labels):
@@ -413,7 +450,8 @@ class Readout:
             ca=float(self.area[child].sum())
             if min(len(child),len(members)-len(child))<self.cfg.min_faces or min(ca,area[region]-ca)<self.cfg.min_area_fraction:continue
             other=members[np.array([result[int(i)] for i in members])==0]
-            if self.evidence.certify(other,child) is not None:
+            interface=[e for u in child for v,e in self.adj[u] if labels[v]==region and result[v]==0]
+            if self.evidence.certify(other,child) is not None or self.freeform.certify(interface) is not None:
                 self.report['surface_split_vetoes']+=1
                 continue
             B=self.B[child];w=self.area[child]
@@ -431,8 +469,13 @@ class Readout:
         # Keep a geometric envelope during this sweep. A network-driven
         # single-face move must not pull a certified surface into its neighbor.
         models={}
+        frozen=set()
         for region in range(len(area)):
             group=np.flatnonzero(labels==region)
+            previous=self._freeform_groups.get(int(group[0]))
+            if previous is not None and np.array_equal(previous,group):
+                frozen.add(region)
+                continue
             for kind in ('plane','revolution','sphere','torus','graph2','graph'):
                 model=self.evidence.fit(kind,group)
                 if model is not None and self.evidence.residual(model,group)<=1:
@@ -452,6 +495,7 @@ class Readout:
         boundary=np.flatnonzero(np.array([any(labels[v]!=labels[u] for v,e in self.adj[u]) for u in range(self.n)]))
         for u in boundary:
             source=int(labels[u]);w=self.area[u]
+            if source in frozen:continue
             destinations={int(labels[v]) for v,e in self.adj[u] if labels[v]!=source}
             if not destinations or count[source]<=self.cfg.min_faces or area[source]-w<self.cfg.min_area_fraction:continue
             if not removal_connected(int(u),source):continue
@@ -459,6 +503,7 @@ class Readout:
             source_energy=self.fit(matrix[source]-m,rhs[source]-b,area[source]-w)[0]
             best=None
             for dest in sorted(destinations):
+                if dest in frozen:continue
                 if dest in models and self.evidence.residual(models[dest],[u])>1:continue
                 if source in models and dest in models:
                     if self.evidence.residual(models[source],[u])+0.1<self.evidence.residual(models[dest],[u]):continue
@@ -493,6 +538,7 @@ class Readout:
             labels=self.coarsen(labels)
         self.report['energy_before_minimum']=self.energy(labels)
         labels=self.coarsen(labels,enforce_minimum=True)
+        labels=self.coarsen(labels,certificates_only=True)
         self.report['energy_after_minimum']=self.energy(labels)
         log(f'Minimum-support enforcement: {labels.max()+1} regions; forced merges={self.report["forced_merges"]}')
         for _ in range(self.cfg.refine_passes):
@@ -584,10 +630,16 @@ def main():
     parser.add_argument('--continuation-normal',type=float,default=.40)
     parser.add_argument('--continuation-curvature',type=float,default=.25)
     parser.add_argument('--continuation-min-faces',type=int,default=48)
+    parser.add_argument('--freeform-probability',type=float,default=.15)
+    parser.add_argument('--freeform-curvature',type=float,default=.50)
+    parser.add_argument('--freeform-outlier-fraction',type=float,default=.08)
+    parser.add_argument('--freeform-ridge-contrast',type=float,default=.15)
     args=parser.parse_args()
     config=Config(min_faces=args.min_faces,min_area_fraction=args.min_area,normal_sigma=args.normal_sigma,distance_edges=args.distance_edges,boundary_weight=args.boundary_weight,region_penalty=args.region_penalty,
                   continuation_distance=args.continuation_distance,continuation_normal=args.continuation_normal,
-                  continuation_curvature=args.continuation_curvature,continuation_min_faces=args.continuation_min_faces)
+                  continuation_curvature=args.continuation_curvature,continuation_min_faces=args.continuation_min_faces,
+                  freeform_probability=args.freeform_probability,freeform_curvature=args.freeform_curvature,
+                  freeform_outlier_fraction=args.freeform_outlier_fraction,freeform_ridge_contrast=args.freeform_ridge_contrast)
     print('Reading mesh and validating full edge correspondence...',flush=True)
     vertices,faces=load_mesh(args.mesh);predictions=read_predictions(args.probabilities)
     positions=validate_mapping(vertices,faces,predictions,Path(args.mesh).suffix.lower()=='.obj')
